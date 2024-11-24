@@ -56,7 +56,7 @@ static uint32_t _fdb_flash_byte_copy(uint32_t src_addr, uint32_t dest_addr, uint
     {
         if(i+data_size > len)
         {
-            read_write_size = len - data_size;
+            read_write_size = len - i;
         }
         _fdb_flash_byte_read(data, src_addr+i, read_write_size);
         if(((dest_addr+i) % FDB_SECTOR_SIZE) == 0)
