@@ -13,7 +13,7 @@ if (!(EXPR))                                                                  \
 
 
 
-#define FDB_PRINT(...)      Trace(0xFFFFFFFF, __VA_ARGS__)
+#define FDB_PRINT(...)      ((void)0)
 
 #define FDB_DB_IS_INIT(db)  (((fdb_tsdb_t)db)->init_flg == 0x5A)
 #define FDB_DB_IS_EMPTY(db)  (((fdb_tsdb_t)db)->handle.max_sec == ((fdb_tsdb_t)db)->handle.min_sec && ((fdb_tsdb_t)db)->handle.unit_num == 0)
@@ -22,7 +22,7 @@ if (!(EXPR))                                                                  \
 
 
 
-uint32_t _fdb_flash_byte_read(uint8_t *pout, uint32_t addr, uint32_t len)
+static uint32_t _fdb_flash_byte_read(uint8_t *pout, uint32_t addr, uint32_t len)
 {
     return len;
 }
@@ -39,7 +39,7 @@ static bool _fdb_flash_sector_erase(uint32_t addr)
 }
 static uint16_t _fdb_crc16_exp(uint8_t *pin, uint16_t len, uint16_t crc16)
 {
-    return 0xFFFF;
+    return 0;
 }
 
 
@@ -67,25 +67,81 @@ static uint32_t _fdb_flash_byte_copy(uint32_t src_addr, uint32_t dest_addr, uint
     }
     return len;
 }
+// 读取一定长度的flash数据并检查是否都为ch
+static bool _fdb_flash_byte_cmp(uint32_t src_addr, uint8_t ch, uint32_t len)
+{
+    uint8_t data[100];
+    uint16_t data_size;
+    uint16_t read_size;
+    
+    read_size = data_size = sizeof(data);
+    for(uint32_t i=0; i<len; i+=data_size)
+    {
+        if(i+data_size > len)
+        {
+            read_size = len - i;
+        }
+        _fdb_flash_byte_read(data, src_addr+i, read_size);
+
+        for(int idx=0; idx<read_size; idx++)
+        {
+            if(data[idx] != ch)
+                return false;
+        }
+    }
+    return true;
+}
 
 
+static bool _get_db_next_location(fdb_tsdb_t db, fdb_unit_location *plocation)
+{    
+    uint16_t unit_sum_1sec, db_sec_sum;
+    bool ret = true;
+
+    if(db == NULL || !FDB_DB_IS_INIT(db) || FDB_DB_IS_EMPTY(db) || plocation == NULL)
+        return false;    
+
+    unit_sum_1sec = db->sec_size / db->handle.unit_size;
+    db_sec_sum = db->handle.db_size / db->sec_size - 2;
+    // 遍历下一个时序记录
+    if(plocation->unit_idx >= (unit_sum_1sec-1))
+    {
+        if(((plocation->sec_idx + 1) % db_sec_sum) > db->handle.max_sec)
+        {
+            ret = false;
+        }
+        else
+        {
+            plocation->sec_idx = (plocation->sec_idx + 1) % db_sec_sum;
+            plocation->unit_idx = 0;
+        }
+    }
+    else
+    {
+        if(plocation->sec_idx == db->handle.max_sec && plocation->unit_idx+1 >= db->handle.unit_num)
+        {
+            ret = false;
+        }
+        else
+        {
+            plocation->unit_idx++;
+        }
+    }
+
+    return ret;
+}
 
 
 /**************************************************
 函数名:
-功能：记录flash管理结构备份的状态
-入参：phandle_bk  -- 要记录的flash管理结构
-        phandle_bk->statu == 0xF1 -- 准备更新flash管理结构
-        phandle_bk->statu == 0x01 -- 更新flash管理结构成功(备份无效化)
-
-      注意:先传0xF1，再传0x01，直接传0x01不会有任何效果
+功能：数据单元修复
+入参：phandle_bk  -- 要记录的fdb管理结构
 出参：none
 ***************************************************/
 static void _set_db_unit_repair_bk(fdb_tsdb_t db, tsdb_unit_repair_bk *punit_repair, uint32_t src_addr)
 {
     uint32_t bk_addr = 0;
     uint32_t offset = 0;
-    static uint8_t have_record_start_update_flag = 0; // 是否提前调用了一次该接口记录准备更新flash管理结构(phandle_bk->statu == 0xF1)
 
     FDB_ASSERT(db != NULL);
     FDB_ASSERT(punit_repair != NULL);
@@ -94,48 +150,30 @@ static void _set_db_unit_repair_bk(fdb_tsdb_t db, tsdb_unit_repair_bk *punit_rep
     FDB_ASSERT(src_addr < db->handle.start_addr + db->handle.db_size);
     FDB_ASSERT(sizeof(tsdb_unit_repair_bk) + punit_repair->data_size <= db->sec_size);
 
-    
     bk_addr = db->handle.start_addr + db->sec_size;
 
-    // 更新flash管理结构成功，无效化该备份
-    if (punit_repair->statu == 0x01)
-    {
-        if (have_record_start_update_flag == 1)
-        {
-            have_record_start_update_flag = 0;
-            //只写一个字节
-            offset = ((uint32_t)(&punit_repair->statu) - (uint32_t)(punit_repair));
-            _fdb_flash_byte_write((uint8_t *)(&punit_repair->statu), bk_addr + offset, sizeof(punit_repair->statu));
+    _fdb_flash_byte_copy(src_addr, bk_addr + sizeof(tsdb_unit_repair_bk), punit_repair->data_size);   
+    
+    punit_repair->type = 2;
+    punit_repair->crc16 = _fdb_crc16_exp((uint8_t *)punit_repair, sizeof(tsdb_unit_repair_bk)-sizeof(punit_repair->crc16), 0xFFFF);
+    _fdb_flash_byte_write((uint8_t *)(punit_repair), bk_addr, sizeof(tsdb_unit_repair_bk));
+    
+    _fdb_flash_byte_copy(bk_addr + sizeof(tsdb_unit_repair_bk), src_addr, punit_repair->data_size);
 
-            return;
-        }
-        else // 前面没传phandle_bk->statu == 0xF1参数调用，没找到写入的flash管理结构备份地址
-        {
-            return;
-        }
-    }
-    else if(punit_repair->statu == 0xF1)
-    {
-        _fdb_flash_byte_copy(src_addr, bk_addr + sizeof(tsdb_unit_repair_bk), punit_repair->data_size);   
-        
-        punit_repair->type = 2;
-        punit_repair->crc16 = _fdb_crc16_exp((uint8_t *)punit_repair, sizeof(tsdb_unit_repair_bk)-sizeof(punit_repair->crc16), 0xFFFF);
-        _fdb_flash_byte_write((uint8_t *)(punit_repair), bk_addr, sizeof(tsdb_unit_repair_bk));
-        
-        _fdb_flash_byte_copy(bk_addr + sizeof(tsdb_unit_repair_bk), src_addr, punit_repair->data_size);
-        
-        have_record_start_update_flag = 1;
-    }
+    //只写一个字节
+    punit_repair->crc16 = 0;
+    offset = FDB_OFFSETOF(tsdb_unit_repair_bk, crc16);
+    _fdb_flash_byte_write((uint8_t *)(&punit_repair->crc16), bk_addr + offset, sizeof(punit_repair->crc16));
 }
 
 
 
 /**************************************************
 函数名:
-功能：记录flash管理结构备份的状态
-入参：phandle_bk  -- 要记录的flash管理结构
-        phandle_bk->statu == 0xF1 -- 准备更新flash管理结构
-        phandle_bk->statu == 0x01 -- 更新flash管理结构成功(备份无效化)
+功能：记录fdb管理结构备份的状态
+入参：phandle_bk  -- 要记录的fdb管理结构
+        phandle_bk->status == 0xF1 -- 准备更新fdb管理结构
+        phandle_bk->status == 0x01 -- 更新fdb管理结构成功(备份无效化)
 
       注意:先传0xF1，再传0x01，直接传0x01不会有任何效果
 出参：none
@@ -144,31 +182,31 @@ static void _set_db_flash_handle_bk(fdb_tsdb_t db, tsdb_flash_handle_bk *phandle
 {
     uint32_t handle_bk_add = 0;
     uint32_t offset = 0;
-    static uint8_t have_record_start_update_flag = 0; // 是否提前调用了一次该接口记录准备更新flash管理结构(phandle_bk->statu == 0xF1)
+    static uint8_t have_record_start_update_flag = 0; // 是否提前调用了一次该接口记录准备更新fdb管理结构(phandle_bk->status == 0xF1)
 
     FDB_ASSERT(db != NULL);
     FDB_ASSERT(phandle_bk != NULL);
     
     handle_bk_add = db->handle.start_addr + db->sec_size;
 
-    // 更新flash管理结构成功，无效化该备份
-    if (phandle_bk->statu == 0x01)
+    // 更新fdb管理结构成功，无效化该备份
+    if (phandle_bk->status == 0x01)
     {
         if (have_record_start_update_flag == 1)
         {
             have_record_start_update_flag = 0;
             //只写一个字节
-            offset = ((uint32_t)(&phandle_bk->statu) - (uint32_t)(phandle_bk));
-            _fdb_flash_byte_write((uint8_t *)(&phandle_bk->statu), handle_bk_add + offset, sizeof(phandle_bk->statu));
+            offset = ((uint32_t)(&phandle_bk->status) - (uint32_t)(phandle_bk));
+            _fdb_flash_byte_write((uint8_t *)(&phandle_bk->status), handle_bk_add + offset, sizeof(phandle_bk->status));
 
             return;
         }
-        else // 前面没传phandle_bk->statu == 0xF1参数调用，没找到写入的flash管理结构备份地址
+        else // 前面没传phandle_bk->status == 0xF1参数调用，没找到写入的fdb管理结构备份地址
         {
             return;
         }
     }
-    else if(phandle_bk->statu == 0xF1)
+    else if(phandle_bk->status == 0xF1)
     {
         _fdb_flash_sector_erase(handle_bk_add);
         _fdb_flash_byte_write((uint8_t *)(phandle_bk), handle_bk_add, sizeof(tsdb_flash_handle_bk));
@@ -232,17 +270,17 @@ static bool _set_db_flash_handle(fdb_tsdb_t db)
         tsdb_flash_handle_bk handle_bk;
         // 记录准备更新(备份)
         handle_bk.type = 1;
-        handle_bk.statu = 0xF1;
+        handle_bk.status = 0xF1;
         memcpy(&(handle_bk.flash_handle), (uint8_t *)(&db->handle), handle_size);
         
         _set_db_flash_handle_bk(db, &handle_bk);
         
-        // 开始更新flash管理结构
+        // 开始更新fdb管理结构
         _fdb_flash_sector_erase(handle_addr);
         _fdb_flash_byte_write((uint8_t *)(&db->handle), handle_addr, handle_size);
         
         // 记录更新成功(无效化备份)
-        handle_bk.statu = 0x01;
+        handle_bk.status = 0x01;
         _set_db_flash_handle_bk(db, &handle_bk);
     }
     // 3.2 可以直接写入
@@ -258,10 +296,10 @@ static bool _set_db_flash_handle(fdb_tsdb_t db)
 
 /**************************************************
 函数名:
-功能：获取某个db对应的flash管理结构的最新值
-      (一页flash分成多个flash管理结构，最后一个单元存放的为目前的实际值)
+功能：获取某个db对应的fdb管理结构的最新值
+      (一页flash分成多个fdb管理结构，最后一个单元存放的为目前的实际值)
 入参：
-出参：0： 没有flash管理结构，1：有flash管理结构  ， 2: 配置改变，新建数据库
+出参：0： 没有fdb管理结构，1：有fdb管理结构  ， 2: 配置改变，新建数据库
 ***************************************************/
 static uint8_t _get_db_flash_handle(fdb_tsdb_t db)
 {
@@ -283,12 +321,11 @@ static uint8_t _get_db_flash_handle(fdb_tsdb_t db)
         _fdb_flash_byte_read((uint8_t *)(&tmp_db.handle), handle_addr + handle_index*handle_size, handle_size);
         if (memcmp((char *)&tmp_db.handle, (char *)&tmp_handle, handle_size) != 0)
         {
-            // 不是全为0xff，则说明该单元可能为最新的flash管理结构            
+            // 不是全为0xff，则说明该单元可能为最新的fdb管理结构            
             crc16 = _fdb_crc16_exp((uint8_t *)(&tmp_db.handle), FDB_OFFSETOF(tsdb_flash_handle, crc16), crc16);
             if (tmp_db.handle.crc16 == crc16)
             {
                 db->offset = handle_index;
-                memcpy(&db->handle, &tmp_db.handle, handle_size);
                 find_flg = 0x01;
                 break;
             }
@@ -315,10 +352,10 @@ static uint8_t _get_db_flash_handle(fdb_tsdb_t db)
         _set_db_flash_handle(db);
         return 2;
     }
-
+    memcpy(&db->handle, &tmp_db.handle, handle_size);
     
     /*
-        4. 容错, 后面有flash管理结构出错，找到的这个flash管理结构不是最新的flash管理结构
+        4. 容错, 后面有fdb管理结构出错，找到的这个fdb管理结构不是最新的fdb管理结构
         写入的时候刚好掉电才会产生这种错误，handle_err_cnt理论上最大只能到1
     */
     if (handle_err_cnt == 1)
@@ -341,7 +378,7 @@ static uint8_t _get_db_flash_handle(fdb_tsdb_t db)
             tmp_db.handle.unit_num = 1;
         }
 
-        // 4.2 检查新位置是否存储了校验通过的数据
+        // 4.2 检查新位置是否存储了校验通过的时序记录
         fdb_unit_location location;
         location.sec_idx = tmp_db.handle.max_sec;
         location.unit_idx = tmp_db.handle.unit_num - 1;
@@ -349,7 +386,7 @@ static uint8_t _get_db_flash_handle(fdb_tsdb_t db)
         memcpy(&tmp_handle, &tmp_db.handle, sizeof(tmp_handle));
         memcpy(&tmp_db, db, sizeof(tmp_db));
         memcpy(&tmp_db.handle, &tmp_handle, sizeof(tmp_db.handle));
-        if(fdb_read_data_by_location(&tmp_db, &location, NULL, NULL))
+        if(fdb_read_data_by_location(&tmp_db, &location, NULL, 0))
         {
             // 更新到flash
             memcpy(&db->handle, &tmp_db.handle, handle_size);
@@ -368,9 +405,8 @@ static uint8_t _get_db_flash_handle(fdb_tsdb_t db)
 static bool _fdb_tsdb_check_data(fdb_tsdb_t db)
 {
     uint32_t sec_addr = 0, data_addr = 0;
-    uint16_t unit_sum_1sec;
+    uint16_t unit_sum_1sec, db_sec_sum;
     uint16_t remain_len = 0;
-    uint8_t val;
     
     if(db == NULL)
     {
@@ -378,34 +414,58 @@ static bool _fdb_tsdb_check_data(fdb_tsdb_t db)
     }
     
     sec_addr = db->handle.start_addr + db->sec_size * (2 + db->handle.max_sec);
-    
+    db_sec_sum = db->handle.db_size / db->sec_size - 2;
     unit_sum_1sec = db->sec_size / db->handle.unit_size;
     if(db->handle.unit_num != unit_sum_1sec)
     {
         // 需要该扇区剩余空间是否为全0xFF
         data_addr = sec_addr + db->handle.unit_num * db->handle.unit_size;
         remain_len = db->sec_size - db->handle.unit_num * db->handle.unit_size;
-        for(int i=0; i<remain_len; i++)
+        if(!_fdb_flash_byte_cmp(data_addr, 0xFF, remain_len))
         {
-            _fdb_flash_byte_read(&val, data_addr+i, 1);
-            if(val != 0xFF)
-            {
-                tsdb_unit_repair_bk unit_repair;
-                unit_repair.sec_idx = db->handle.max_sec;
-                unit_repair.data_size = db->handle.unit_num * db->handle.unit_size;
-                unit_repair.statu = 0xF1;
-                _set_db_unit_repair_bk(db, &unit_repair, sec_addr);
-                
-                unit_repair.statu = 0x01;
-                _set_db_unit_repair_bk(db, &unit_repair, sec_addr);
-                break;
-            }
+            tsdb_unit_repair_bk unit_repair;
+            unit_repair.sec_idx = db->handle.max_sec;
+            unit_repair.data_size = db->handle.unit_num * db->handle.unit_size;
+            _set_db_unit_repair_bk(db, &unit_repair, sec_addr);
         }
     }
-    if(!(db->handle.min_sec == db->handle.max_sec && db->handle.unit_num == 0))
+    else if(((db->handle.max_sec + 1) % db_sec_sum) == db->handle.min_sec)
     {
+        // 自修复机制2
+        uint8_t update_flg = 1;
+        fdb_unit_location location;
+        uint32_t ts1, ts2;
+        location.unit_idx = 0;
+        location.sec_idx = db->handle.min_sec;
+        if(fdb_read_data_by_location(db, &location, (uint8_t *)(&ts1), sizeof(ts1)))
+        {
+            if(_get_db_next_location(db, &location))
+            {
+                if(fdb_read_data_by_location(db, &location, (uint8_t *)(&ts2), sizeof(ts2)))
+                {
+                    if(ts2 > ts1) // 1个扇区只存储一条时序记录，需要该操作
+                        update_flg = 0;
+                }
+                // else: 可能是min_sec扇区写了一个最新的时序记录
+            }
+            else
+            {
+                update_flg = 0;
+            }
+        }
+        if(update_flg)
+        {
+            // 更新到flash
+            db->handle.min_sec = (db->handle.min_sec + 1) % db_sec_sum;
+            _set_db_flash_handle(db);
+        }
+    }
+    
+    if(!FDB_DB_IS_EMPTY(db))
+    {    
         data_addr = sec_addr + (db->handle.unit_num-1)*db->handle.unit_size;
         _fdb_flash_byte_read((uint8_t *)&db->newest_ts, data_addr, sizeof(db->newest_ts));
+        
 	    _fdb_flash_byte_read((uint8_t *)&db->oldest_ts, db->handle.start_addr + (2 + db->handle.min_sec)*db->sec_size, sizeof(db->oldest_ts));
     }
 	return true;
@@ -440,9 +500,9 @@ static bool _fdb_tsdb_repair(fdb_tsdb_t db)
     {
         case 1: // 修复flash_handle
             phandle_bk = (tsdb_flash_handle_bk *)tmp_data;
-            if(phandle_bk->statu == 0xF1)
+            if(phandle_bk->status == 0xF1)
             {
-                tmp_crc16 = _fdb_crc16_exp((uint8_t *)(&phandle_bk->flash_handle), sizeof(phandle_bk->flash_handle) - sizeof(phandle_bk->flash_handle.crc16), 0xFFFF);
+                tmp_crc16 = _fdb_crc16_exp((uint8_t *)(&phandle_bk->flash_handle), FDB_OFFSETOF(tsdb_flash_handle, crc16), 0xFFFF);
                 if(tmp_crc16 == phandle_bk->flash_handle.crc16)
                 {
                     /* 判断配置是否改变，改变则新建数据库覆盖旧的数据库 */
@@ -458,35 +518,31 @@ static bool _fdb_tsdb_repair(fdb_tsdb_t db)
                         memcpy(&db->handle, &phandle_bk->flash_handle, sizeof(db->handle));
                         _set_db_flash_handle(db);
                     }
-                    offset = ((uint32_t)(&phandle_bk->statu) - (uint32_t)(phandle_bk));
-                    phandle_bk->statu = 0x01;
-                    _fdb_flash_byte_write((uint8_t *)(&phandle_bk->statu), bk_addr + offset, sizeof(phandle_bk->statu));
+                    offset = FDB_OFFSETOF(tsdb_flash_handle_bk, status);
+                    phandle_bk->status = 0x01;
+                    _fdb_flash_byte_write((uint8_t *)(&phandle_bk->status), bk_addr + offset, sizeof(phandle_bk->status));
                 }
             }
             break;
             
         case 2:
             unit_repair_bk = (tsdb_unit_repair_bk *)tmp_data;
-            if(unit_repair_bk->statu == 0xF1)
+            tmp_crc16 = _fdb_crc16_exp((uint8_t *)unit_repair_bk, FDB_OFFSETOF(tsdb_unit_repair_bk, crc16), 0xFFFF);
+            if(tmp_crc16 == unit_repair_bk->crc16)
             {
-                tmp_crc16 = _fdb_crc16_exp((uint8_t *)unit_repair_bk, sizeof(tsdb_unit_repair_bk) - sizeof(unit_repair_bk->crc16), 0xFFFF);
-                if(tmp_crc16 == unit_repair_bk->crc16)
+                /* 判断数据库配置是否改变 */
+                if((unit_repair_bk->sec_idx < (db->handle.db_size/db->sec_size - 2))
+                    && (unit_repair_bk->data_size <= db->sec_size)
+                    && (unit_repair_bk->data_size <= (db->sec_size - sizeof(tsdb_unit_repair_bk))))
                 {
-                    /* 判断数据库配置是否改变 */
-                    if((unit_repair_bk->sec_idx < (db->handle.db_size/db->sec_size - 2))
-                        && (unit_repair_bk->data_size <= db->sec_size)
-                        && (unit_repair_bk->data_size <= (db->sec_size - sizeof(tsdb_unit_repair_bk))))
-                    {
-                        data_addr = bk_addr + sizeof(tsdb_unit_repair_bk);
-                        sec_addr = db->handle.start_addr + (2 + unit_repair_bk->sec_idx)*db->sec_size;
+                    data_addr = bk_addr + sizeof(tsdb_unit_repair_bk);
+                    sec_addr = db->handle.start_addr + (2 + unit_repair_bk->sec_idx)*db->sec_size;
 
-                        _fdb_flash_byte_copy(data_addr, sec_addr, unit_repair_bk->data_size);
-                    }
-
-                    offset = ((uint32_t)(&unit_repair_bk->statu) - (uint32_t)(unit_repair_bk));
-                    unit_repair_bk->statu = 0x01;
-                    _fdb_flash_byte_write((uint8_t *)(&unit_repair_bk->statu), bk_addr + offset, sizeof(unit_repair_bk->statu));
+                    _fdb_flash_byte_copy(data_addr, sec_addr, unit_repair_bk->data_size);
                 }
+                unit_repair_bk->crc16 = 0;
+                offset = FDB_OFFSETOF(tsdb_unit_repair_bk, crc16);
+                _fdb_flash_byte_write((uint8_t *)(&unit_repair_bk->crc16), bk_addr + offset, sizeof(unit_repair_bk->crc16));
             }
             break;
             
@@ -500,9 +556,9 @@ static bool _fdb_tsdb_repair(fdb_tsdb_t db)
 
 /**************************************************
 函数名:
-功能：给出左边和右边数据点位置，然后返回中间的数据点位置
+功能：给出左边和右边时序记录位置，然后返回中间的时序记录位置
 入参： 
-       注意：左右位置之间的数据点为偶数时（包括左右位置上只有一个数据点，总共两个的时候），返回偏向左边的数据点
+       注意：左右位置之间的时序记录为偶数时（包括左右位置上只有一个时序记录，总共两个的时候），返回偏向左边的时序记录
 出参：  0x00: 没找到(左点和右点是同一个值)   0x01: 找到了  0x02: 左右位置不合法
 ***************************************************/
 static uint8_t _fdb_cal_mid_unit_location(fdb_tsdb_t db, 
@@ -574,7 +630,7 @@ static uint8_t _fdb_find_unit_location_by_time(fdb_tsdb_t db, uint32_t target_ti
     uint32_t db_data_addr;
     uint16_t db_sec_sum, unit_sum_1sec;
 
-    if(db->handle.max_sec == 0 || db->handle.min_sec == 0 || db->handle.unit_num == 0)
+    if(FDB_DB_IS_EMPTY(db))
     {
         ret_ack = 0x04;
         return ret_ack;
@@ -634,7 +690,7 @@ static uint8_t _fdb_find_unit_location_by_time(fdb_tsdb_t db, uint32_t target_ti
                 ret_ack = 0x00;
                 break;
             }
-            // 此时mid等于min，说明min和max之间没有其他数据点，min比较过了就差max点没比较了
+            // 此时mid等于min，说明min和max之间没有其他时序记录，min比较过了就差max点没比较了
             if ((min_location.sec_idx == mid_location.sec_idx) && (min_location.unit_idx == mid_location.unit_idx))
             {
                 mid_add = db_data_addr + max_location.sec_idx * db->sec_size + max_location.unit_idx * db->handle.unit_size;
@@ -647,7 +703,7 @@ static uint8_t _fdb_find_unit_location_by_time(fdb_tsdb_t db, uint32_t target_ti
                 }
                 else if (mid_time > target_time)
                 {
-                    // 没找到，返回开始点后第一个采集并存储的数据点位置
+                    // 没找到，返回开始点后第一个采集并存储的时序记录位置
                     memcpy((char *)pout, (char *)&max_location, sizeof(fdb_unit_location));
                     ret_ack = 0x00;
                 }
@@ -677,63 +733,108 @@ static uint8_t _fdb_find_unit_location_by_time(fdb_tsdb_t db, uint32_t target_ti
 }
 
 
+
 /**************************************************
 函数名:
-功能：获取指定位置的数据点
+功能：读取时序记录的用户数据
+入参：
+    tsl         : 时序记录的信息
+    pout        ：用于返回读取到的数据，可为空
+    outlen      ：pout指向的缓冲区大小
+    mode        : 模式，0：不校验crc，1：校验crc，
+出参： 0：校验失败，其他值：用户数据的长度
+***************************************************/
+uint16_t fdb_read_tsl(fdb_tsl_t tsl, void *pout, uint16_t outlen, uint8_t mode)
+{
+    uint16_t ret = 0;
+    uint16_t crc16 = 0xFFFF, store_crc16;
+    uint8_t val;
+    
+    if((pout == NULL) || (tsl == NULL))
+    {
+        return ret;
+    }
+    
+    _fdb_flash_byte_read(pout, tsl->data_addr, outlen);
+    ret = outlen;
+
+    if(1 == mode)
+    {
+        crc16 = _fdb_crc16_exp((uint8_t *)pout, outlen, crc16);
+        for(int i = outlen; i < tsl->data_size; i++)
+        {
+            _fdb_flash_byte_read((uint8_t *)&val, tsl->data_addr + i, 1);
+            crc16 = _fdb_crc16_exp((uint8_t *)&val, 1, crc16);
+        }
+        _fdb_flash_byte_read((uint8_t *)&store_crc16, tsl->crc16_addr, sizeof(store_crc16));
+
+        if(crc16 != store_crc16)
+        {
+            FDB_PRINT("%s: tsl user data crc err\r\n", __func__);
+            ret = 0;
+        }
+    }
+
+    return ret;
+}
+
+
+
+/**************************************************
+函数名:
+功能：获取指定位置的时序记录
 入参：
     db          : 数据库
     location    ：位置信息
     pout        ：用于返回读取到的数据，可为空
-    poutlen     ：用于传入pout指向的缓冲区大小和用于返回读取到的数据大小
-出参： true: 校验通过, false: 校验未通过
+    outlen      ：pout指向的缓冲区大小
+出参： 0: 校验未通过； >0: 校验通过，数据单元的大小
 ***************************************************/
-bool fdb_read_data_by_location(fdb_tsdb_t db, fdb_unit_location *plocation, void *pout, uint16_t *poutlen)
+uint32_t fdb_read_data_by_location(fdb_tsdb_t db, fdb_unit_location *plocation, void *pout, uint32_t outlen)
 {
-    uint16_t tmp_crc16 = 0xFFFF, read_crc16 = 0xFFFF;
+    uint32_t tmp_crc16 = 0xFFFF, read_crc16 = 0xFFFF;
     uint8_t val;
     uint32_t data_addr = 0;
-    uint16_t num = 0;
+    uint32_t ret = 0;
     
     if((db == NULL) || (plocation == NULL))
     {
         return false;
     }
-
+    ret = db->handle.unit_size;
     data_addr = db->handle.start_addr + (2 + plocation->sec_idx) * db->sec_size;
     data_addr += db->handle.unit_size * plocation->unit_idx;
 
-    if(pout != NULL && poutlen != NULL && (*poutlen > db->handle.unit_size))
+    if(pout != NULL && (outlen >= db->handle.unit_size))
     {   
         _fdb_flash_byte_read((uint8_t *)pout, data_addr, db->handle.unit_size);
 		memcpy(&read_crc16, ((char *)pout)+db->crc_offset, sizeof(read_crc16));
-        tmp_crc16 = _fdb_crc16_exp(((uint8_t *)pout) + sizeof(read_crc16), db->handle.unit_size - sizeof(read_crc16), tmp_crc16);
-        *poutlen = db->handle.unit_size;
+        tmp_crc16 = _fdb_crc16_exp(((uint8_t *)pout) + db->data_offset, db->handle.unit_size - db->data_offset, tmp_crc16);
         
         if(tmp_crc16 == read_crc16)
         {
-            return true;
+            return ret;
         }
     }
     else
     {
         _fdb_flash_byte_read((uint8_t *)&read_crc16, data_addr+db->crc_offset, sizeof(read_crc16));
-        num = 0;
         for(int i=db->data_offset; i<db->handle.unit_size; i++)
         {
             _fdb_flash_byte_read(&val, data_addr + i, 1);
-            if(pout != NULL && num < *poutlen)
+            if(pout != NULL && i < outlen)
             {   
-                ((uint8_t*)pout)[num++] = val;
+                ((uint8_t*)pout)[i] = val;
             }
             tmp_crc16 = _fdb_crc16_exp(&val, 1, tmp_crc16);
         }
         if(tmp_crc16 == read_crc16)
         {
-            return true;
+            return ret;
         }
     }
 
-    return false;
+    return 0;
 }
 
 
@@ -743,20 +844,21 @@ bool fdb_read_data_by_location(fdb_tsdb_t db, fdb_unit_location *plocation, void
 功能：初始化数据库
 入参：
     db:         数据库句柄
-    add：        数据库存储的起始地址，必须对齐扇区地址
-    size：       数据库的大小，扇区0用来存储管理结构，扇区1用于数据备份中转，扇区2之后才是用于存储数据
-    unit_size:  每个数据单元的大小, 大小范围为[20, FDB_SECTOR_SIZE-6], FDB_SECTOR_SIZE-6: 消耗4个字节存储时间戳+2字节存储crc16
+    addr：       数据库存储的起始地址，必须对齐扇区地址
+    size：       数据库的大小，扇区0用来存储管理结构，扇区1用于数据备份中转，扇区2之后才是用于存储时序记录
+    data_size:  用户数据的最大长度, 大小范围为[sizeof(tsdb_unit_repair_bk)-6, FDB_SECTOR_SIZE-6]；
+                    数据单元大小=用户数据的最大长度+6，一个数据单元存储一条时序记录；
+                    每个时序记录包括4个字节时间戳+2字节crc16+N字节用户数据，N<=data_size
 出参：
 ***************************************************/
-bool fdb_tsdb_init(fdb_tsdb_t db, uint32_t addr, uint32_t size, uint16_t unit_size)
+bool fdb_tsdb_init(fdb_tsdb_t db, uint32_t addr, uint32_t size, uint16_t data_size)
 {
     FDB_ASSERT(db != NULL);
     FDB_ASSERT((addr % FDB_SECTOR_SIZE) == 0);
     FDB_ASSERT((size % FDB_SECTOR_SIZE) == 0);
-    FDB_ASSERT(size > 4 * FDB_SECTOR_SIZE);
-    FDB_ASSERT((unit_size + 6) <= FDB_SECTOR_SIZE);
-    FDB_ASSERT(unit_size >= sizeof(tsdb_flash_handle_bk));
-    FDB_ASSERT(unit_size >= sizeof(tsdb_unit_repair_bk));
+    FDB_ASSERT(size >= 4 * FDB_SECTOR_SIZE);
+    FDB_ASSERT((data_size + 6) <= FDB_SECTOR_SIZE);
+    FDB_ASSERT((data_size + 6) >= sizeof(tsdb_unit_repair_bk));
 
     memset(&db->handle, 0, sizeof(db->handle));
     db->offset = 0xffff;
@@ -766,7 +868,7 @@ bool fdb_tsdb_init(fdb_tsdb_t db, uint32_t addr, uint32_t size, uint16_t unit_si
     db->data_offset = sizeof(uint32_t) + sizeof(uint16_t);
     db->handle.start_addr = addr;
     db->handle.db_size = size;
-    db->handle.unit_size = unit_size + 6;
+    db->handle.unit_size = data_size + 6;
     
     _fdb_tsdb_repair(db);
 
@@ -779,10 +881,35 @@ bool fdb_tsdb_init(fdb_tsdb_t db, uint32_t addr, uint32_t size, uint16_t unit_si
     return true;
 }
 
+/**************************************************
+函数名:
+功能：重置数据库，保留原本配置，将已经存储的数据清除
+入参：
+    db:         数据库句柄
+出参：
+***************************************************/
+bool fdb_tsdb_deinit(fdb_tsdb_t db)
+{
+    if(db == NULL)
+        return false;
+    if(!FDB_DB_IS_INIT(db))
+        return false;
+
+    db->handle.max_sec = 0;
+    db->handle.min_sec = 0;
+    db->handle.unit_num = 0;
+    db->offset = 0xFFFF;
+    db->newest_ts = 0;
+    db->oldest_ts = 0;
+    _set_db_flash_handle(db);
+    
+    db->init_flg = 0x5A;
+    return true;
+}
 
 /**************************************************
 函数名:
-功能：查询存储的数据点数量
+功能：查询存储的时序记录数量
 入参：
         db:         数据库句柄
 出参：
@@ -807,11 +934,11 @@ uint32_t fdb_query_tsl_num(fdb_tsdb_t db)
 
 /**************************************************
 函数名:
-功能：查找数据库指定的数据点（通过指定往前的偏移）
+功能：查找数据库指定的时序记录（通过指定往前的偏移）
 入参：
     db:         数据库句柄
-    index:      哪个数据点的，1：最新的数据点，2：次新的数据点...依此类推
-    cb:         用户用于处理找到的数据点的函数指针
+    index:      哪个时序记录，1：最新的时序记录，2：次新的时序记录...依此类推
+    cb:         用户用于处理找到的时序记录的函数指针
     cb_arg:     用户需要传递给cb的参数
 出参：
 ***************************************************/
@@ -852,13 +979,14 @@ bool fdb_query_tsl_by_index(fdb_tsdb_t db, uint32_t index, fdb_tsl_cb cb, void *
     if(cb != NULL)
     {
         tsl.addr = db->handle.start_addr + (location.sec_idx + 2) * db->sec_size + location.unit_idx * db->handle.unit_size;
-        _fdb_flash_byte_read((uint8_t *)&tsl.time, tsl.addr + db->ts_offset, sizeof(tsl.time));
-        _fdb_flash_byte_read((uint8_t *)&tsl.crc16, tsl.addr + db->crc_offset, sizeof(tsl.crc16));
-        tsl.addr += db->data_offset;
-        tsl.size = db->handle.unit_size - db->data_offset;
+        tsl.unit_size = db->handle.unit_size;
+        _fdb_flash_byte_read((uint8_t *)(&tsl.time), tsl.addr + db->ts_offset, sizeof(tsl.time));
         
-        if(!cb(&tsl, cb_arg))
-            return false;
+        tsl.crc16_addr = tsl.addr + db->crc_offset;
+        tsl.data_addr = tsl.addr + db->data_offset;
+        tsl.data_size = db->handle.unit_size - db->data_offset;
+                
+        cb(&tsl, cb_arg);
     }
     return true;
 }
@@ -866,21 +994,18 @@ bool fdb_query_tsl_by_index(fdb_tsdb_t db, uint32_t index, fdb_tsl_cb cb, void *
 
 /**************************************************
 函数名:
-功能：查找数据库的一个或者多个数据点（通过指定时间段）
+功能：查找数据库的一个或者多个时序记录（通过指定时间段）
 入参：
     db:         数据库句柄
     from:       起始时间
     to:         结束时间
-    cb:         用户用于处理找到的数据点的函数指针
+    cb:         用户用于处理找到的时序记录的函数指针
     cb_arg:     用户需要传递给cb的参数
 出参：
 ***************************************************/
 uint32_t fdb_query_tsl_by_time(fdb_tsdb_t db, uint32_t from, uint32_t to, fdb_tsl_cb cb, void *cb_arg)
 {
     uint32_t ret = 0;
-    uint32_t data_addr;
-    uint32_t now_time;
-    uint16_t crc16;
     uint8_t status = 0x00;
     fdb_unit_location start_location;
     struct fdb_tsl tsl;
@@ -892,29 +1017,32 @@ uint32_t fdb_query_tsl_by_time(fdb_tsdb_t db, uint32_t from, uint32_t to, fdb_ts
     if((from > db->newest_ts) || (to < db->oldest_ts))
         return ret;
 
-
     status = _fdb_find_unit_location_by_time(db, from, &start_location);
     if(status <= 2)
     {
+        tsl.unit_size = db->handle.unit_size;
         do
         {
-            data_addr = db->handle.start_addr + (start_location.sec_idx + 2) * db->sec_size + db->handle.unit_size * start_location.unit_idx;
-            _fdb_flash_byte_read((uint8_t *)&now_time, data_addr + db->ts_offset, sizeof(now_time));
-            if(now_time >= from && now_time <= to)
+            tsl.addr = db->handle.start_addr + (start_location.sec_idx + 2) * db->sec_size + db->handle.unit_size * start_location.unit_idx;
+            _fdb_flash_byte_read((uint8_t *)&tsl.time, tsl.addr + db->ts_offset, sizeof(tsl.time));
+            if(tsl.time>= from && tsl.time <= to)
             {
                 if(cb!=NULL)
                 {
-                    _fdb_flash_byte_read((uint8_t *)&crc16, data_addr + db->crc_offset, sizeof(crc16));
-                    tsl.time = now_time;
-                    tsl.crc16 = crc16;
-                    tsl.addr = data_addr + db->data_offset;
-                    tsl.size = db->handle.unit_size - db->data_offset;
-                    if!(cb(&tsl, cb_arg))
+                    tsl.crc16_addr = tsl.addr + db->crc_offset;
+                    tsl.data_addr = tsl.addr + db->data_offset;
+                    tsl.data_size = db->handle.unit_size - db->data_offset;
+                    if(!cb(&tsl, cb_arg))
                         break;
                 }
                 ret++;
             }
             else
+            {
+                break;
+            }
+            // 遍历下一个时序记录
+            if(!_get_db_next_location(db, &start_location))
             {
                 break;
             }
@@ -939,22 +1067,27 @@ bool fdb_tsl_store(fdb_tsdb_t db, void *pin, uint16_t size, uint32_t timestamp)
         return false;
     if(timestamp < db->newest_ts)
         return false;
-    
+
+    if(FDB_DB_IS_EMPTY(db))
+    {
+        db->oldest_ts = timestamp;
+        _fdb_flash_sector_erase(db->handle.start_addr + 2 * db->sec_size);
+    }
     unit_sum_1sec = db->sec_size / db->handle.unit_size;
     db_sec_sum = db->handle.db_size / db->sec_size - 2;
-    
-    
-    
+        
     memcpy(&tmp_handle, &db->handle, sizeof(tmp_handle));
     if(tmp_handle.unit_num >= unit_sum_1sec)
     {
         if(((tmp_handle.max_sec + 1) % db_sec_sum) == tmp_handle.min_sec)
         {
             tmp_handle.min_sec = (tmp_handle.min_sec + 1) % db_sec_sum; // 滚动覆盖一个扇区的空间
+             _fdb_flash_byte_read((uint8_t *)&db->oldest_ts, db->handle.start_addr + (2 + tmp_handle.min_sec)*db->sec_size, sizeof(db->oldest_ts));
         }
         tmp_handle.max_sec = (tmp_handle.max_sec + 1) % db_sec_sum;
 
         write_addr = tmp_handle.start_addr + (tmp_handle.max_sec + 2) * db->sec_size;
+        _fdb_flash_sector_erase(write_addr);
         tmp_handle.unit_num = 1;
     }
     else
@@ -963,9 +1096,17 @@ bool fdb_tsl_store(fdb_tsdb_t db, void *pin, uint16_t size, uint32_t timestamp)
         tmp_handle.unit_num = tmp_handle.unit_num + 1;
     }
 
+    size = (size <= db->handle.unit_size - 6) ? size : (db->handle.unit_size - 6);
     crc16 = _fdb_crc16_exp((uint8_t *)pin, size, crc16);
+    if(size+6 < db->handle.unit_size)
+    {
+        uint8_t c_0xff = 0xFF;
+        for(int i=size+6; i<db->handle.unit_size; i++)
+            crc16 = _fdb_crc16_exp((uint8_t *)&c_0xff, 1, crc16);
+    }
+    db->newest_ts = timestamp;
     _fdb_flash_byte_write((uint8_t *)pin, write_addr + db->data_offset, size);
-    _fdb_flash_byte_write((uint8_t *)&timestamp, write_addr + db->ts_offset, sizeof(timestamp));
+    _fdb_flash_byte_write((uint8_t *)&db->newest_ts, write_addr + db->ts_offset, sizeof(db->newest_ts));
     _fdb_flash_byte_write((uint8_t *)&crc16, write_addr + db->crc_offset, sizeof(crc16));
 
     memcpy(&db->handle, &tmp_handle, sizeof(db->handle));
@@ -973,5 +1114,6 @@ bool fdb_tsl_store(fdb_tsdb_t db, void *pin, uint16_t size, uint32_t timestamp)
 
     return true;
 }
+
 
 
